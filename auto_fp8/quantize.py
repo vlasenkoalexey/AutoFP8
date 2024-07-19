@@ -10,6 +10,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import BaseQuantizeConfig
 
+try:
+    import fbgemm_gpu.experimental.gen_ai  # noqa: F401
+    print("Successfully imported fbgemm_gpu")
+except e:
+    print("Failed to import fbgemm_gpu: ", e)
+
 
 # HACK: Override the dtype_byte_size function in transformers to support float8 types
 # Fix is posted upstream https://github.com/huggingface/transformers/pull/30488
@@ -59,6 +65,43 @@ def per_tensor_quantize(tensor: torch.Tensor) -> Tuple[torch.Tensor, float]:
     qweight = qweight.to(torch.float8_e4m3fn)
     scale = scale.float().reciprocal()
     return qweight, scale
+
+
+def per_tensor_quantize_llama_rowwise(
+    w: torch.Tensor,
+    fp8_activation_scale_ub: float = 1200.0,
+) -> Tuple[torch.Tensor, float]:
+    """Quantize [n, k] weight tensor.
+
+    Args:
+        w (Tensor): [n, k] input high precision tensor to quantize.
+        fp8_activation_scale_ub (float): Upper bound for activation max.
+    """
+    if torch.cuda.is_available():
+        activation_scale_ub = torch.tensor(
+            [fp8_activation_scale_ub],
+            dtype=torch.float,
+            device="cuda",
+        )
+        wq, w_scale = torch.ops.fbgemm.quantize_fp8_per_row(w)
+        return wq, w_scale
+    else:
+        # from quantize_test.py
+        #fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        #w_max = w.abs().max()
+        #w_scale_ref = (w_max / fp8_max).float()
+        #wq_ref = (w * fp8_max / w_max).to(torch.float8_e4m3fn)
+        #return wq_ref, w_scale_ref
+        E4M3_MAX_POS: float = torch.finfo(torch.float8_e4m3fn).max
+        EPS: float = 1e-12
+        FP16_MAX_POS: float = torch.finfo(torch.float16).max        
+        x = w
+        x_row_max = torch.max(torch.abs(x), dim=1).values
+        max_scaling_factor = E4M3_MAX_POS * 512.0  # Match kernel logics
+        scale = torch.Tensor(E4M3_MAX_POS / x_row_max).clamp(max=max_scaling_factor)
+        xq = (x * scale.unsqueeze(1)).to(torch.float8_e4m3fn)
+        return xq, scale.reciprocal().to(torch.float32)
+        
 
 
 def static_per_tensor_quantize(tensor: torch.Tensor, inv_scale: float) -> torch.Tensor:
@@ -130,6 +173,45 @@ class FP8DynamicLinear(torch.nn.Module):
             out_dtype=x.dtype,
         )
         return output
+    
+# Class responsible for quantizing weights for LLama
+class FP8DynamicLlamaRowWiseLinear(torch.nn.Module):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: torch.nn.Parameter,
+        fp8_activation_scale_ub: Optional[float] = 1200.0,
+    ):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight, requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
+        self.bias = bias
+
+    def forward(self, x):
+#        qinput, x_scale = per_tensor_quantize(x)
+#        output = fp8_gemm(
+#            A=qinput,
+#            A_scale=x_scale,
+#            B=self.weight,
+#            B_scale=self.weight_scale,
+#            bias=self.bias,
+#            out_dtype=x.dtype,
+#        )
+        activation_scale_ub = torch.tensor(
+            [fp8_activation_scale_ub],
+            dtype=torch.float,
+            device="cuda",
+        ) if fp8_activation_scale_ub is not None else None
+    
+        num_tokens = None
+        xq, x_scale = torch.ops.fbgemm.quantize_fp8_per_row(
+            x, num_tokens, activation_scale_ub
+        )
+        y = torch.ops.fbgemm.f8f8bf16_rowwise(
+            xq, self.weight, x_scale, self.weight_scale, use_fast_accum=True
+        )
+        return y    
 
 
 # Module responsible for taking already quantized weights, and recording input scales (and possibly output scales) using an activation observer
@@ -234,15 +316,25 @@ def quantize_weights(
             or name in quantize_config.ignored_layers
         ):
             continue
-        quant_weight, weight_scale = per_tensor_quantize(linear.weight)
         bias = copy.deepcopy(linear.bias) if linear.bias is not None else None
-        quant_linear = FP8DynamicLinear(
-            weight=quant_weight, weight_scale=weight_scale, bias=bias
-        )
+        if quantize_config.activation_scheme == "dynamic_llama_rowwise":
+            quant_weight, weight_scale = per_tensor_quantize_llama_rowwise(linear.weight)
+            quant_linear = FP8DynamicLlamaRowWiseLinear(
+                weight=quant_weight, weight_scale=weight_scale, bias=bias
+            )
+        else:
+            quant_weight, weight_scale = per_tensor_quantize(linear.weight)
+            quant_linear = FP8DynamicLinear(
+                weight=quant_weight, weight_scale=weight_scale, bias=bias
+            )
         replace_module(model, name, quant_linear)
+        print("name: ", name)
+        #print("shape: ", linear.shape)
         del linear.weight
         del linear.bias
         del linear
+        #print("cleaning up memory")
+        cleanup_memory()
     cleanup_memory()
 
 

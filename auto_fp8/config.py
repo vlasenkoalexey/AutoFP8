@@ -31,9 +31,9 @@ class BaseQuantizeConfig:
     ):
         if quant_method != "fp8":
             raise ValueError("Only FP8 quantization is supported.")
-        if activation_scheme not in ["static", "dynamic"]:
+        if activation_scheme not in ["static", "dynamic", "dynamic_llama_rowwise"]:
             raise ValueError(
-                "Invalid activation_scheme. Choose either 'static' or 'dynamic'."
+                "Invalid activation_scheme. Choose either 'static' or 'dynamic' or 'dynamic_llama_rowwise'."
             )
         self.quant_method = quant_method
         self.activation_scheme = activation_scheme
